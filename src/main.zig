@@ -1,53 +1,57 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
+
+const Io = std.Io;
+const Threaded = Io.Threaded;
+const net = Io.net;
+const File = Io.File;
+const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
 
 // ---------------------------------------------------------------------------
-// YggCrawl — Yggdrasil NodeInfo crawler on Zig 0.17.0.
+// YggCrawl — Yggdrasil NodeInfo crawler on Zig 0.17.0, no C glue code.
 //
 // Architecture:
-//   1) collect local peers through the Yggdrasil Admin API (TCP, JSON)
+//   1) collect local peers through the Yggdrasil Admin API (std.Io.net + std.json)
 //   2) walk the network graph in rounds: debug_remotegetpeers + getNodeInfo
 //   3) probe the target TCP port on every known address
 //   4) export the results to JSON
-// Storage — SQLite (through the system libsqlite3).
+//
+// Everything except the SQLite library itself is std: sockets and timeouts come
+// from `std.Io.net`, name resolution is std's own resolver (/etc/hosts +
+// /etc/resolv.conf), file output is `std.Io.Dir` + `std.Io.File`, and the
+// concurrency comes from `Io.Group.async` bounded by the `-workers` limit.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_WORKERS: i64 = 32;
-const DEFAULT_PORT: i64 = 80;
+const DEFAULT_WORKERS: usize = 32;
+const DEFAULT_PORT: u16 = 80;
 const DEFAULT_ADMIN = "127.0.0.1:9001";
 const DEFAULT_DB = "./yggcrawl.db";
+const EXPORT_FILE = "yggcrawl.json";
+
+const ADMIN_TIMEOUT_MS: i64 = 3000;
+const REMOTE_TIMEOUT_MS: i64 = 4000;
+const PROBE_TIMEOUT_MS: i64 = 3000;
 
 const SQLITE_OK = c.SQLITE_OK;
 const SQLITE_ROW = c.SQLITE_ROW;
-const SQLITE_DONE = c.SQLITE_DONE;
 
 const SQLITE_TRANSIENT: c.sqlite3_destructor_type =
     @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
 var g_out: *std.Io.Writer = undefined;
 
-fn print(comptime fmt: []const u8, args: anytype) void {
-    g_out.print(fmt, args) catch {};
-}
-
 fn println(comptime fmt: []const u8, args: anytype) void {
     g_out.print(fmt ++ "\n", args) catch {};
     g_out.flush() catch {};
 }
 
-/// Simple blocking mutex on top of std.atomic.Mutex.
-const Mutex = struct {
-    m: std.atomic.Mutex = .unlocked,
-
-    fn lock(self: *Mutex) void {
-        while (!self.m.tryLock()) std.Thread.yield() catch {};
-    }
-
-    fn unlock(self: *Mutex) void {
-        self.m.unlock();
-    }
-};
+/// Declaration of how long an `Io` operation may take before giving up,
+/// measured on the awake clock.
+fn timeoutOf(ms: i64) Io.Timeout {
+    return .{ .duration = .{ .raw = Io.Duration.fromMilliseconds(ms), .clock = .awake } };
+}
 
 // ===========================================================================
 // main
@@ -55,68 +59,44 @@ const Mutex = struct {
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
-    const io = init.io;
-
-    var stdout_buf: [1 << 16]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    g_out = &stdout_writer.interface;
 
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
-    var workers: i64 = DEFAULT_WORKERS;
-    var port: i64 = DEFAULT_PORT;
+    var workers: usize = DEFAULT_WORKERS;
+    var port: u16 = DEFAULT_PORT;
     var admin: []const u8 = DEFAULT_ADMIN;
     var db_path: []const u8 = DEFAULT_DB;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
-        const a: []const u8 = argv[i];
-        if (flagMatch(a, "-workers", "--workers")) |m| {
-            switch (m) {
-                .val => |v| workers = std.fmt.parseInt(i64, v, 10) catch workers,
-                .bare => if (i + 1 < argv.len) {
-                    i += 1;
-                    workers = std.fmt.parseInt(i64, argv[i], 10) catch workers;
-                },
-                .no => {},
-            }
-        } else if (flagMatch(a, "-port", "--port")) |m| {
-            switch (m) {
-                .val => |v| port = std.fmt.parseInt(i64, v, 10) catch port,
-                .bare => if (i + 1 < argv.len) {
-                    i += 1;
-                    port = std.fmt.parseInt(i64, argv[i], 10) catch port;
-                },
-                .no => {},
-            }
-        } else if (flagMatch(a, "-admin", "--admin")) |m| {
-            switch (m) {
-                .val => |v| admin = v,
-                .bare => if (i + 1 < argv.len) {
-                    i += 1;
-                    admin = argv[i];
-                },
-                .no => {},
-            }
-        } else if (flagMatch(a, "-db", "--db")) |m| {
-            switch (m) {
-                .val => |v| db_path = v,
-                .bare => if (i + 1 < argv.len) {
-                    i += 1;
-                    db_path = argv[i];
-                },
-                .no => {},
-            }
+        if (nextArg(argv, &i, argv[i], "-workers", "--workers")) |v| {
+            workers = std.fmt.parseInt(usize, v, 10) catch workers;
+        } else if (nextArg(argv, &i, argv[i], "-port", "--port")) |v| {
+            port = std.fmt.parseInt(u16, v, 10) catch port;
+        } else if (nextArg(argv, &i, argv[i], "-admin", "--admin")) |v| {
+            admin = v;
+        } else if (nextArg(argv, &i, argv[i], "-db", "--db")) |v| {
+            db_path = v;
         }
     }
+    if (workers == 0) workers = 1;
 
-    if (workers < 1) workers = 1;
+    // The `-workers` flag *is* the size of the Io thread pool: async tasks are
+    // dispatched to at most this many pool threads, the rest run eagerly on the
+    // calling thread.
+    var threaded: Io.Threaded = .init(alloc, .{ .async_limit = .limited(workers) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var stdout_buf: [1 << 16]u8 = undefined;
+    var stdout_writer = File.stdout().writer(io, &stdout_buf);
+    g_out = &stdout_writer.interface;
 
     println("YggCrawl - High-performance Yggdrasil crawler (SQLite)", .{});
     println("Workers: {d} | Admin API: {s} | Port to probe: {d}", .{ workers, admin, port });
     println("------------------------------------------------------------------", .{});
 
-    const db = initDB(db_path) catch |err| {
+    const db = initDB(alloc, db_path) catch |err| {
         println("Database initialization failed: {s}", .{@errorName(err)});
         return;
     };
@@ -124,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 1. Local peers
     println("[1/4] Collecting local peers...", .{});
-    fetchAndInsertLocalPeers(alloc, db, admin) catch |err| {
+    fetchAndInsertLocalPeers(alloc, io, db, admin) catch |err| {
         println("Failed to fetch local peers: {s}", .{@errorName(err)});
         return;
     };
@@ -133,10 +113,10 @@ pub fn main(init: std.process.Init) !void {
     println("[2/4] Starting the network graph walk...", .{});
     var previous_count: i64 = -1;
     while (true) {
-        fetchAndUpdateRemoteGetPeers(alloc, db, admin, @intCast(workers)) catch |err| {
+        fetchAndUpdateRemoteGetPeers(alloc, io, db, admin, workers) catch |err| {
             println("remote get peers failed: {s}", .{@errorName(err)});
         };
-        fetchAndUpdateNodeInfo(alloc, db, admin, @intCast(workers)) catch |err| {
+        fetchAndUpdateNodeInfo(alloc, io, db, admin, workers) catch |err| {
             println("nodeinfo update failed: {s}", .{@errorName(err)});
         };
 
@@ -150,18 +130,18 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
         previous_count = current_count;
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(2), .awake) catch {};
+        io.sleep(.fromSeconds(2), .awake) catch {};
     }
 
     // 3. Port probe
     println("[3/4] Probing port {d}...", .{port});
-    checkPortOnAllPeers(alloc, db, @intCast(workers), @intCast(port)) catch |err| {
+    checkPortOnAllPeers(alloc, io, db, workers, port) catch |err| {
         println("Port scan failed: {s}", .{@errorName(err)});
     };
 
     // 4. Export
     println("[4/4] Exporting data to JSON...", .{});
-    exportToJSON(alloc, db, "yggcrawl.json") catch |err| {
+    exportToJSON(alloc, io, db, EXPORT_FILE) catch |err| {
         println("Export failed: {s}", .{@errorName(err)});
     };
 
@@ -186,13 +166,34 @@ fn flagMatch(arg: []const u8, comptime short: []const u8, comptime long: []const
     return null;
 }
 
+/// Returns the value of `-flag value` / `-flag=value`, advancing `i` past a
+/// separate value argument.
+fn nextArg(
+    argv: []const [:0]const u8,
+    i: *usize,
+    arg: []const u8,
+    comptime short: []const u8,
+    comptime long: []const u8,
+) ?[]const u8 {
+    const m = flagMatch(arg, short, long) orelse return null;
+    switch (m) {
+        .no => return null,
+        .val => |v| return v,
+        .bare => {
+            if (i.* + 1 >= argv.len) return null;
+            i.* += 1;
+            return argv[i.*];
+        },
+    }
+}
+
 // ===========================================================================
-// SQLite
+// SQLite (the one remaining C library, through the translate-c module)
 // ===========================================================================
 
-fn initDB(path: []const u8) !*c.sqlite3 {
-    const path_z = try std.heap.c_allocator.dupeSentinel(u8, path, 0);
-    defer std.heap.c_allocator.free(path_z);
+fn initDB(alloc: Allocator, path: []const u8) !*c.sqlite3 {
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
 
     var db: ?*c.sqlite3 = null;
     const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
@@ -249,8 +250,16 @@ fn colText(stmt: ?*c.sqlite3_stmt, idx: c_int) []const u8 {
     return std.mem.span(p);
 }
 
+fn bindText(stmt: ?*c.sqlite3_stmt, idx: c_int, text: []const u8) void {
+    if (text.len == 0) {
+        _ = c.sqlite3_bind_null(stmt, idx);
+        return;
+    }
+    _ = c.sqlite3_bind_text(stmt, idx, text.ptr, @intCast(text.len), SQLITE_TRANSIENT);
+}
+
 // ===========================================================================
-// Admin API (TCP + JSON)
+// Admin API (TCP + JSON over std.Io.net)
 // ===========================================================================
 
 /// Calls the Yggdrasil Admin API. Returns the response payload
@@ -258,10 +267,11 @@ fn colText(stmt: ?*c.sqlite3_stmt, idx: c_int) []const u8 {
 /// otherwise the raw response). Memory is allocated in `alloc`.
 fn callAdminAPI(
     alloc: Allocator,
+    io: Io,
     endpoint: []const u8,
     request: []const u8,
     key: ?[]const u8,
-    timeout_ms: i32,
+    timeout_ms: i64,
 ) ![]u8 {
     // --- build the request body ---
     var obj = std.json.ObjectMap.empty;
@@ -281,10 +291,14 @@ fn callAdminAPI(
     );
     defer alloc.free(body);
 
-    const raw = try tcpRequest(alloc, endpoint, body, timeout_ms);
+    const raw = try tcpExchange(alloc, io, endpoint, body, timeout_ms);
     defer alloc.free(raw);
 
-    // --- unwrap the response ---
+    return unwrapApiResponse(alloc, raw);
+}
+
+/// Splits `{status, response}` apart, failing on an explicit non-success status.
+fn unwrapApiResponse(alloc: Allocator, raw: []const u8) ![]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch {
         return alloc.dupe(u8, raw);
     };
@@ -293,12 +307,9 @@ fn callAdminAPI(
     if (parsed.value == .object) {
         if (parsed.value.object.get("status")) |st| {
             if (st == .string) {
-                if (!std.mem.eql(u8, st.string, "success")) {
-                    return error.ApiError;
-                }
+                if (!std.mem.eql(u8, st.string, "success")) return error.ApiError;
                 if (parsed.value.object.get("response")) |resp| {
-                    const s = try std.json.Stringify.valueAlloc(alloc, resp, .{});
-                    return s;
+                    return std.json.Stringify.valueAlloc(alloc, resp, .{});
                 }
             }
         }
@@ -306,152 +317,202 @@ fn callAdminAPI(
     return alloc.dupe(u8, raw);
 }
 
-/// Opens a TCP connection, sends `payload`, reads the response until close.
-fn tcpRequest(alloc: Allocator, endpoint: []const u8, payload: []const u8, timeout_ms: i32) ![]u8 {
+/// Opens a TCP connection to `endpoint`, sends `payload`, reads until the peer
+/// closes the connection or the timeout expires.
+fn tcpExchange(
+    alloc: Allocator,
+    io: Io,
+    endpoint: []const u8,
+    payload: []const u8,
+    timeout_ms: i64,
+) ![]u8 {
     const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.BadEndpoint;
     var host: []const u8 = endpoint[0..colon];
-    const port_str = endpoint[colon + 1 ..];
+    const port = try std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10);
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
         host = host[1 .. host.len - 1];
     }
     if (host.len == 0) host = "127.0.0.1";
 
-    const host_z = try alloc.dupeSentinel(u8, host, 0);
-    defer alloc.free(host_z);
-    const port_z = try alloc.dupeSentinel(u8, port_str, 0);
-    defer alloc.free(port_z);
+    var stream = try connectHost(io, alloc, host, port, timeout_ms);
+    defer stream.close(io);
 
-    var hints = std.mem.zeroes(c.struct_addrinfo);
-    hints.ai_family = c.AF_UNSPEC;
-    hints.ai_socktype = c.SOCK_STREAM;
+    try sendAll(io, &stream, payload, timeout_ms);
+    return recvAll(alloc, io, &stream, timeout_ms);
+}
 
-    var res: ?*c.struct_addrinfo = null;
-    if (c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res) != 0) return error.NameResolution;
-    defer c.freeaddrinfo(res);
+/// Connects to a literal address, falling back to std's own name resolution
+/// (which reads /etc/hosts and /etc/resolv.conf — no getaddrinfo involved).
+fn connectHost(io: Io, alloc: Allocator, host: []const u8, port: u16, timeout_ms: i64) !net.Stream {
+    if (net.IpAddress.parse(host, port)) |addr| {
+        return connectWithTimeout(io, addr, timeout_ms);
+    } else |_| {}
 
-    var fd: c_int = -1;
-    var it = res;
-    while (it) |ai| : (it = ai.ai_next) {
-        const s = c.socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol);
-        if (s < 0) continue;
-        if (connectTimeout(s, ai.ai_addr, ai.ai_addrlen, timeout_ms)) {
-            fd = s;
-            break;
-        }
-        _ = c.close(s);
+    var addresses: std.ArrayList(net.IpAddress) = .empty;
+    defer addresses.deinit(alloc);
+    try resolveHost(alloc, io, host, port, &addresses);
+
+    var last_err: net.IpAddress.ConnectError = error.ConnectionRefused;
+    for (addresses.items) |address| {
+        if (connectWithTimeout(io, address, timeout_ms)) |stream| {
+            return stream;
+        } else |err| last_err = err;
     }
-    if (fd < 0) return error.Connect;
+    return last_err;
+}
 
-    defer _ = c.close(fd);
+/// Name resolution through std's resolver: literal IPs, /etc/hosts, then the
+/// DNS servers from /etc/resolv.conf.
+fn resolveHost(
+    alloc: Allocator,
+    io: Io,
+    host: []const u8,
+    port: u16,
+    out: *std.ArrayList(net.IpAddress),
+) !void {
+    const name = try net.HostName.init(host);
 
-    // read/write timeouts
-    setSockTimeout(fd, timeout_ms);
+    var results_buffer: [32]net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(net.HostName.LookupResult) = .init(&results_buffer);
+    var lookup_future = io.async(net.HostName.lookup, .{
+        name,
+        io,
+        &queue,
+        net.HostName.LookupOptions{ .port = port },
+    });
+    defer lookup_future.cancel(io) catch {};
 
-    // send
+    while (queue.getOne(io)) |result| {
+        switch (result) {
+            .address => |address| try out.append(alloc, address),
+            .canonical_name => {},
+        }
+    } else |err| switch (err) {
+        error.Closed => {},
+        error.Canceled => return error.Canceled,
+    }
+    try lookup_future.await(io);
+}
+
+/// A TCP connection with an explicit deadline.
+///
+/// `std.Io.net`'s `IpAddress.connect` panics as soon as a timeout is requested
+/// ("TODO implement netConnectIpPosix with timeout"), so the non-blocking
+/// connect + poll dance is spelled out here on top of the syscall layer; the
+/// resulting socket is put back into blocking mode for the I/O that follows.
+fn connectWithTimeout(
+    io: Io,
+    address: net.IpAddress,
+    timeout_ms: i64,
+) net.IpAddress.ConnectError!net.Stream {
+    const linux = std.os.linux;
+
+    if (builtin.os.tag != .linux) {
+        // No deadline support through the Io vtable on this target.
+        const addr = address;
+        return addr.connect(io, .{ .mode = .stream });
+    }
+
+    const family: u32 = switch (address) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const raw_fd = linux.socket(
+        family,
+        linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+        linux.IPPROTO.TCP,
+    );
+    switch (linux.errno(raw_fd)) {
+        .SUCCESS => {},
+        .MFILE, .NFILE => return error.ProcessFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .PROTONOSUPPORT => return error.ProtocolUnsupportedBySystem,
+        else => return error.Unexpected,
+    }
+    const fd: std.posix.socket_t = @intCast(raw_fd);
+    errdefer _ = linux.close(fd);
+
+    var storage: Threaded.PosixAddress = undefined;
+    const addr_len = Threaded.addressToPosix(&address, &storage);
+
+    switch (linux.errno(linux.connect(fd, @ptrCast(&storage), addr_len))) {
+        .SUCCESS => {},
+        .INPROGRESS, .AGAIN => {
+            var poll_fds = [1]std.posix.pollfd{.{
+                .fd = fd,
+                .events = std.posix.POLL.OUT,
+                .revents = 0,
+            }};
+            const clamped: i32 = @intCast(@min(timeout_ms, std.math.maxInt(i32)));
+            const ready = std.posix.poll(&poll_fds, clamped) catch return error.Unexpected;
+            if (ready == 0) return error.Timeout;
+
+            // A finished connect() is confirmed by the socket having a peer.
+            var peer: std.posix.sockaddr = undefined;
+            var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+            std.posix.getpeername(fd, &peer, &peer_len) catch return error.ConnectionRefused;
+        },
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .TIMEDOUT => return error.Timeout,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .ACCES => return error.AccessDenied,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        else => return error.Unexpected,
+    }
+
+    // Reads and writes below rely on the socket blocking.
+    _ = linux.fcntl(fd, linux.F.SETFL, 0);
+
+    return .{ .socket = .{ .handle = fd, .address = address } };
+}
+
+fn sendAll(io: Io, stream: *const net.Stream, payload: []const u8, timeout_ms: i64) !void {
     var sent: usize = 0;
     while (sent < payload.len) {
-        const n = c.send(fd, payload.ptr + sent, payload.len - sent, c.MSG_NOSIGNAL);
-        if (n <= 0) return error.SendFailed;
-        sent += @intCast(n);
+        const data = [_][]const u8{payload[sent..]};
+        const n = try (try io.operateTimeout(.{ .net_write = .{
+            .socket_handle = stream.socket.handle,
+            .data = &data,
+        } }, timeoutOf(timeout_ms))).net_write;
+        if (n == 0) return error.SendFailed;
+        sent += n;
     }
+}
 
-    // read until EOF
+/// Reads until end of stream. A timeout is not an error here: whatever arrived
+/// by then is the answer.
+fn recvAll(alloc: Allocator, io: Io, stream: *const net.Stream, timeout_ms: i64) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    var chunk: [16384]u8 = undefined;
+    errdefer buf.deinit(alloc);
+
+    var chunk: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = c.recv(fd, &chunk, chunk.len, 0);
-        if (n > 0) {
-            try buf.appendSlice(alloc, chunk[0..@intCast(n)]);
-        } else if (n == 0) {
-            break;
-        } else {
-            const e = std.c._errno().*;
-            if (e == c.EINTR) continue;
-            // timeout/error — return whatever we managed to read
-            break;
-        }
+        var iovecs = [1][]u8{chunk[0..]};
+        const result = io.operateTimeout(.{ .net_read = .{
+            .socket_handle = stream.socket.handle,
+            .data = &iovecs,
+        } }, timeoutOf(timeout_ms)) catch break;
+
+        const read = result.net_read catch break;
+        if (read.data_len == 0) break;
+        try buf.appendSlice(alloc, chunk[0..read.data_len]);
     }
-    return alloc.dupe(u8, buf.items);
-}
-
-fn connectTimeout(fd: c_int, addr: ?*const c.struct_sockaddr, addrlen: c.socklen_t, timeout_ms: i32) bool {
-    const old = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
-    _ = c.fcntl(fd, c.F_SETFL, @as(c_int, old | c.O_NONBLOCK));
-
-    const rc = c.connect(fd, addr, addrlen);
-    if (rc == 0) {
-        _ = c.fcntl(fd, c.F_SETFL, old);
-        return true;
-    }
-
-    const e = std.c._errno().*;
-    if (e != c.EINPROGRESS and e != c.EWOULDBLOCK) return false;
-
-    var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
-    const pr = c.poll(&pfd, 1, timeout_ms);
-    if (pr <= 0) return false;
-
-    var so_err: c_int = 0;
-    var len: c.socklen_t = @sizeOf(c_int);
-    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &so_err, &len) != 0) return false;
-    if (so_err != 0) return false;
-
-    _ = c.fcntl(fd, c.F_SETFL, old);
-    return true;
-}
-
-fn setSockTimeout(fd: c_int, timeout_ms: i32) void {
-    const tv = c.struct_timeval{
-        .tv_sec = @divTrunc(timeout_ms, 1000),
-        .tv_usec = @intCast(@mod(timeout_ms, 1000) * 1000),
-    };
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.struct_timeval));
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(c.struct_timeval));
-}
-
-// ===========================================================================
-// Worker pool
-// ===========================================================================
-
-fn runPool(comptime Ctx: type, alloc: Allocator, workers: usize, ctx: *Ctx, comptime workerFn: fn (*Ctx) void) void {
-    if (workers == 0) return;
-    const threads = alloc.alloc(std.Thread, workers) catch {
-        workerFn(ctx);
-        return;
-    };
-    defer alloc.free(threads);
-
-    var spawned: usize = 0;
-    for (0..workers) |k| {
-        threads[k] = std.Thread.spawn(.{}, workerFn, .{ctx}) catch break;
-        spawned += 1;
-    }
-    if (spawned == 0) {
-        workerFn(ctx);
-        return;
-    }
-    for (threads[0..spawned]) |t| t.join();
-}
-
-fn nextIndex(comptime Ctx: type, ctx: *Ctx) ?usize {
-    ctx.mutex.lock();
-    defer ctx.mutex.unlock();
-    if (ctx.next >= ctx.n) return null;
-    const i = ctx.next;
-    ctx.next += 1;
-    return i;
+    return buf.toOwnedSlice(alloc);
 }
 
 // ===========================================================================
 // Crawler logic
 // ===========================================================================
 
-fn fetchAndInsertLocalPeers(alloc: Allocator, db: *c.sqlite3, endpoint: []const u8) !void {
-    const raw = try callAdminAPI(alloc, endpoint, "getPeers", null, 3000);
+fn fetchAndInsertLocalPeers(alloc: Allocator, io: Io, db: *c.sqlite3, endpoint: []const u8) !void {
+    const raw = try callAdminAPI(alloc, io, endpoint, "getPeers", null, ADMIN_TIMEOUT_MS);
     defer alloc.free(raw);
 
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch return error.BadPeersJson;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch
+        return error.BadPeersJson;
     defer parsed.deinit();
 
     const peers = blk: {
@@ -474,13 +535,10 @@ fn fetchAndInsertLocalPeers(alloc: Allocator, db: *c.sqlite3, endpoint: []const 
 
     for (peers.items) |peer| {
         if (peer != .object) continue;
-        const key = jsonStr(peer.object.get("key"));
-        const address = jsonStr(peer.object.get("address"));
-        const remote = jsonStr(peer.object.get("remote"));
         _ = c.sqlite3_reset(stmt);
-        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_TRANSIENT);
-        _ = c.sqlite3_bind_text(stmt, 2, address.ptr, @intCast(address.len), SQLITE_TRANSIENT);
-        _ = c.sqlite3_bind_text(stmt, 3, remote.ptr, @intCast(remote.len), SQLITE_TRANSIENT);
+        bindText(stmt, 1, jsonStr(peer.object.get("key")));
+        bindText(stmt, 2, jsonStr(peer.object.get("address")));
+        bindText(stmt, 3, jsonStr(peer.object.get("remote")));
         _ = c.sqlite3_step(stmt);
     }
     try exec(db, "COMMIT");
@@ -496,54 +554,49 @@ fn jsonStr(v: ?std.json.Value) []const u8 {
 
 // ---- phase: debug_remotegetpeers -----------------------------------------
 
+const RemoteResult = struct {
+    ok: bool = false,
+    raw: []u8 = &.{},
+    found: []const []u8 = &.{},
+};
+
 const RemoteCtx = struct {
     alloc: Allocator,
     endpoint: []const u8,
     keys: []const []const u8,
-    n: usize,
-    next: usize = 0,
-    mutex: Mutex = .{},
     results: []RemoteResult,
-
-    const RemoteResult = struct {
-        ok: bool = false,
-        raw: []u8 = &.{},
-        found: []const []u8 = &.{},
-    };
 };
 
-fn remoteWorker(ctx: *RemoteCtx) void {
-    while (nextIndex(RemoteCtx, ctx)) |i| {
-        const k = ctx.keys[i];
-        const raw = callAdminAPI(ctx.alloc, ctx.endpoint, "debug_remotegetpeers", k, 4000) catch continue;
+fn remoteWorker(io: Io, ctx: *RemoteCtx, i: usize) void {
+    const k = ctx.keys[i];
+    const raw = callAdminAPI(ctx.alloc, io, ctx.endpoint, "debug_remotegetpeers", k, REMOTE_TIMEOUT_MS) catch return;
 
-        var found: std.ArrayList([]u8) = .empty;
-        const parsed = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch {
-            ctx.results[i] = .{ .ok = true, .raw = raw, .found = &.{} };
-            continue;
-        };
-        defer parsed.deinit();
-        if (parsed.value == .object) {
-            var vit = parsed.value.object.iterator();
-            while (vit.next()) |entry| {
-                const obj = entry.value_ptr.*;
-                if (obj != .object) continue;
-                const keys_v = obj.object.get("keys") orelse continue;
-                if (keys_v != .array) continue;
-                for (keys_v.array.items) |item| {
-                    if (item == .string) {
-                        const dup = ctx.alloc.dupe(u8, item.string) catch continue;
-                        found.append(ctx.alloc, dup) catch {};
-                    }
+    var found: std.ArrayList([]u8) = .empty;
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch {
+        ctx.results[i] = .{ .ok = true, .raw = raw, .found = &.{} };
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        var vit = parsed.value.object.iterator();
+        while (vit.next()) |entry| {
+            const obj = entry.value_ptr.*;
+            if (obj != .object) continue;
+            const keys_v = obj.object.get("keys") orelse continue;
+            if (keys_v != .array) continue;
+            for (keys_v.array.items) |item| {
+                if (item == .string) {
+                    const dup = ctx.alloc.dupe(u8, item.string) catch continue;
+                    found.append(ctx.alloc, dup) catch {};
                 }
             }
         }
-        const found_owned = found.toOwnedSlice(ctx.alloc) catch &.{};
-        ctx.results[i] = .{ .ok = true, .raw = raw, .found = found_owned };
     }
+    const found_owned = found.toOwnedSlice(ctx.alloc) catch &.{};
+    ctx.results[i] = .{ .ok = true, .raw = raw, .found = found_owned };
 }
 
-fn freeRemoteResults(alloc: Allocator, results: []RemoteCtx.RemoteResult) void {
+fn freeRemoteResults(alloc: Allocator, results: []RemoteResult) void {
     for (results) |r| {
         if (r.raw.len != 0) alloc.free(r.raw);
         for (r.found) |f| alloc.free(f);
@@ -551,12 +604,18 @@ fn freeRemoteResults(alloc: Allocator, results: []RemoteCtx.RemoteResult) void {
     }
 }
 
-fn fetchAndUpdateRemoteGetPeers(alloc: Allocator, db: *c.sqlite3, endpoint: []const u8, workers: usize) !void {
+fn fetchAndUpdateRemoteGetPeers(
+    alloc: Allocator,
+    io: Io,
+    db: *c.sqlite3,
+    endpoint: []const u8,
+    workers: usize,
+) !void {
     var keys = try queryStrings(alloc, db, "SELECT key FROM yggcrawl WHERE peers IS NULL OR peers = ''");
     defer freeStringList(alloc, &keys);
     if (keys.items.len == 0) return;
 
-    const results = try alloc.alloc(RemoteCtx.RemoteResult, keys.items.len);
+    const results = try alloc.alloc(RemoteResult, keys.items.len);
     defer alloc.free(results);
     for (results) |*r| r.* = .{};
     defer freeRemoteResults(alloc, results);
@@ -565,10 +624,9 @@ fn fetchAndUpdateRemoteGetPeers(alloc: Allocator, db: *c.sqlite3, endpoint: []co
         .alloc = alloc,
         .endpoint = endpoint,
         .keys = keys.items,
-        .n = keys.items.len,
         .results = results,
     };
-    runPool(RemoteCtx, alloc, workers, &ctx, remoteWorker);
+    try runWorkers(io, &ctx, results.len, workers, remoteWorker);
 
     const upd = "UPDATE yggcrawl SET peers = ? WHERE key = ?";
     const ins = "INSERT INTO yggcrawl (key) VALUES (?) ON CONFLICT(key) DO NOTHING";
@@ -577,25 +635,47 @@ fn fetchAndUpdateRemoteGetPeers(alloc: Allocator, db: *c.sqlite3, endpoint: []co
 
     var upd_stmt: ?*c.sqlite3_stmt = null;
     var ins_stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &upd_stmt, null) != SQLITE_OK) return error.Prepare;
+    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &upd_stmt, null) != SQLITE_OK)
+        return error.Prepare;
     defer _ = c.sqlite3_finalize(upd_stmt);
-    if (c.sqlite3_prepare_v2(db, ins.ptr, @intCast(ins.len), &ins_stmt, null) != SQLITE_OK) return error.Prepare;
+    if (c.sqlite3_prepare_v2(db, ins.ptr, @intCast(ins.len), &ins_stmt, null) != SQLITE_OK)
+        return error.Prepare;
     defer _ = c.sqlite3_finalize(ins_stmt);
 
     for (results, 0..) |r, i| {
         if (!r.ok) continue;
         _ = c.sqlite3_reset(upd_stmt);
-        _ = c.sqlite3_bind_text(upd_stmt, 1, r.raw.ptr, @intCast(r.raw.len), SQLITE_TRANSIENT);
-        _ = c.sqlite3_bind_text(upd_stmt, 2, keys.items[i].ptr, @intCast(keys.items[i].len), SQLITE_TRANSIENT);
+        bindText(upd_stmt, 1, r.raw);
+        bindText(upd_stmt, 2, keys.items[i]);
         _ = c.sqlite3_step(upd_stmt);
 
         for (r.found) |fk| {
             _ = c.sqlite3_reset(ins_stmt);
-            _ = c.sqlite3_bind_text(ins_stmt, 1, fk.ptr, @intCast(fk.len), SQLITE_TRANSIENT);
+            bindText(ins_stmt, 1, fk);
             _ = c.sqlite3_step(ins_stmt);
         }
     }
     try exec(db, "COMMIT");
+}
+
+/// Dispatches `count` tasks of `worker` across the Io thread pool. The pool is
+/// bounded by `workers`; tasks beyond that limit run eagerly on this thread, so
+/// this behaves like a worker pool with an exact ceiling.
+fn runWorkers(
+    io: Io,
+    ctx: anytype,
+    count: usize,
+    workers: usize,
+    worker: anytype,
+) !void {
+    var group: Io.Group = .init;
+    for (0..count) |i| {
+        group.async(io, worker, .{ io, ctx, i });
+        // Tasks past the pool limit ran eagerly, so bound the spawned-out work
+        // by awaiting what is already in flight before adding more.
+        if ((i + 1) % workers == 0) group.await(io) catch {};
+    }
+    group.await(io) catch {};
 }
 
 // ---- phase: getNodeInfo ---------------------------------------------------
@@ -604,20 +684,21 @@ const NodeCtx = struct {
     alloc: Allocator,
     endpoint: []const u8,
     keys: []const []const u8,
-    n: usize,
-    next: usize = 0,
-    mutex: Mutex = .{},
     results: []?[]u8,
 };
 
-fn nodeWorker(ctx: *NodeCtx) void {
-    while (nextIndex(NodeCtx, ctx)) |i| {
-        const raw = callAdminAPI(ctx.alloc, ctx.endpoint, "getNodeInfo", ctx.keys[i], 4000) catch continue;
-        ctx.results[i] = raw;
-    }
+fn nodeWorker(io: Io, ctx: *NodeCtx, i: usize) void {
+    const raw = callAdminAPI(ctx.alloc, io, ctx.endpoint, "getNodeInfo", ctx.keys[i], REMOTE_TIMEOUT_MS) catch return;
+    ctx.results[i] = raw;
 }
 
-fn fetchAndUpdateNodeInfo(alloc: Allocator, db: *c.sqlite3, endpoint: []const u8, workers: usize) !void {
+fn fetchAndUpdateNodeInfo(
+    alloc: Allocator,
+    io: Io,
+    db: *c.sqlite3,
+    endpoint: []const u8,
+    workers: usize,
+) !void {
     var keys = try queryStrings(alloc, db, "SELECT key FROM yggcrawl WHERE checked = FALSE");
     defer freeStringList(alloc, &keys);
     if (keys.items.len == 0) return;
@@ -633,22 +714,22 @@ fn fetchAndUpdateNodeInfo(alloc: Allocator, db: *c.sqlite3, endpoint: []const u8
         .alloc = alloc,
         .endpoint = endpoint,
         .keys = keys.items,
-        .n = keys.items.len,
         .results = results,
     };
-    runPool(NodeCtx, alloc, workers, &ctx, nodeWorker);
+    try runWorkers(io, &ctx, results.len, workers, nodeWorker);
 
     const upd = "UPDATE yggcrawl SET nodeinfo = ?, checked = TRUE WHERE key = ?";
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &stmt, null) != SQLITE_OK) return error.Prepare;
+    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &stmt, null) != SQLITE_OK)
+        return error.Prepare;
     defer _ = c.sqlite3_finalize(stmt);
 
     try exec(db, "BEGIN");
     for (results, 0..) |r, i| {
         const payload = r orelse continue;
         _ = c.sqlite3_reset(stmt);
-        _ = c.sqlite3_bind_text(stmt, 1, payload.ptr, @intCast(payload.len), SQLITE_TRANSIENT);
-        _ = c.sqlite3_bind_text(stmt, 2, keys.items[i].ptr, @intCast(keys.items[i].len), SQLITE_TRANSIENT);
+        bindText(stmt, 1, payload);
+        bindText(stmt, 2, keys.items[i]);
         _ = c.sqlite3_step(stmt);
     }
     try exec(db, "COMMIT");
@@ -662,50 +743,31 @@ const Task = struct {
 };
 
 const ScanCtx = struct {
-    alloc: Allocator,
     tasks: []Task,
-    n: usize,
-    next: usize = 0,
-    mutex: Mutex = .{},
     port: u16,
     results: []bool,
 };
 
-fn scanWorker(ctx: *ScanCtx) void {
-    while (nextIndex(ScanCtx, ctx)) |i| {
-        const t = ctx.tasks[i];
-        ctx.results[i] = dialTcp(t.ip, ctx.port, 3000);
-    }
+fn scanWorker(io: Io, ctx: *ScanCtx, i: usize) void {
+    ctx.results[i] = probePort(io, ctx.tasks[i].ip, ctx.port, PROBE_TIMEOUT_MS);
 }
 
-fn dialTcp(host: []const u8, port: u16, timeout_ms: i32) bool {
-    var port_buf: [16]u8 = undefined;
-    const ps = std.fmt.bufPrint(port_buf[0..15], "{d}", .{port}) catch return false;
-    port_buf[ps.len] = 0;
-    const port_z: [:0]const u8 = port_buf[0..ps.len :0];
-    const host_z = std.heap.c_allocator.dupeSentinel(u8, host, 0) catch return false;
-    defer std.heap.c_allocator.free(host_z);
-
-    var hints = std.mem.zeroes(c.struct_addrinfo);
-    hints.ai_family = c.AF_UNSPEC;
-    hints.ai_socktype = c.SOCK_STREAM;
-
-    var res: ?*c.struct_addrinfo = null;
-    if (c.getaddrinfo(host_z.ptr, port_z.ptr, &hints, &res) != 0) return false;
-    defer c.freeaddrinfo(res);
-
-    var it = res;
-    while (it) |ai| : (it = ai.ai_next) {
-        const s = c.socket(ai.ai_family, ai.ai_socktype, ai.ai_protocol);
-        if (s < 0) continue;
-        const ok = connectTimeout(s, ai.ai_addr, ai.ai_addrlen, timeout_ms);
-        _ = c.close(s);
-        if (ok) return true;
-    }
-    return false;
+/// True when a TCP connection to `host:port` could be established.
+fn probePort(io: Io, host: []const u8, port: u16, timeout_ms: i64) bool {
+    const addr = net.IpAddress.parse(host, port) catch
+        net.IpAddress.resolve(io, host, port) catch return false;
+    var stream = connectWithTimeout(io, addr, timeout_ms) catch return false;
+    stream.close(io);
+    return true;
 }
 
-fn checkPortOnAllPeers(alloc: Allocator, db: *c.sqlite3, workers: usize, port: u16) !void {
+fn checkPortOnAllPeers(
+    alloc: Allocator,
+    io: Io,
+    db: *c.sqlite3,
+    workers: usize,
+    port: u16,
+) !void {
     // build map[ip] -> [keys]
     var address_to_keys = std.array_hash_map.String(std.ArrayList([]u8)).empty;
     defer {
@@ -720,7 +782,8 @@ fn checkPortOnAllPeers(alloc: Allocator, db: *c.sqlite3, workers: usize, port: u
     {
         const sql = "SELECT key, address, peers FROM yggcrawl WHERE address != '' OR peers != ''";
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK) return error.Prepare;
+        if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK)
+            return error.Prepare;
         defer _ = c.sqlite3_finalize(stmt);
 
         while (c.sqlite3_step(stmt) == SQLITE_ROW) {
@@ -728,17 +791,14 @@ fn checkPortOnAllPeers(alloc: Allocator, db: *c.sqlite3, workers: usize, port: u
             const addr = colText(stmt, 1);
             const peers = colText(stmt, 2);
 
-            if (addr.len != 0) {
-                try addAddrKey(alloc, &address_to_keys, addr, key);
-            }
+            if (addr.len != 0) try addAddrKey(alloc, &address_to_keys, addr, key);
             if (peers.len != 0) {
+                // `peers` is a JSON object keyed by the peer address.
                 const parsed = std.json.parseFromSlice(std.json.Value, alloc, peers, .{}) catch continue;
                 defer parsed.deinit();
                 if (parsed.value == .object) {
                     var it = parsed.value.object.iterator();
-                    while (it.next()) |e| {
-                        try addAddrKey(alloc, &address_to_keys, e.key_ptr.*, key);
-                    }
+                    while (it.next()) |e| try addAddrKey(alloc, &address_to_keys, e.key_ptr.*, key);
                 }
             }
         }
@@ -772,19 +832,14 @@ fn checkPortOnAllPeers(alloc: Allocator, db: *c.sqlite3, workers: usize, port: u
     defer alloc.free(results);
     for (results) |*r| r.* = false;
 
-    var ctx = ScanCtx{
-        .alloc = alloc,
-        .tasks = tasks,
-        .n = tasks.len,
-        .port = port,
-        .results = results,
-    };
-    runPool(ScanCtx, alloc, workers, &ctx, scanWorker);
+    var ctx = ScanCtx{ .tasks = tasks, .port = port, .results = results };
+    try runWorkers(io, &ctx, results.len, workers, scanWorker);
 
     // store the results
     const upd = "UPDATE yggcrawl SET port_status = ?, port_checked = ? WHERE key = ?";
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &stmt, null) != SQLITE_OK) return error.Prepare;
+    if (c.sqlite3_prepare_v2(db, upd.ptr, @intCast(upd.len), &stmt, null) != SQLITE_OK)
+        return error.Prepare;
     defer _ = c.sqlite3_finalize(stmt);
 
     try exec(db, "BEGIN");
@@ -792,9 +847,9 @@ fn checkPortOnAllPeers(alloc: Allocator, db: *c.sqlite3, workers: usize, port: u
         const status: []const u8 = if (results[i]) "open" else "closed";
         for (t.keys) |k| {
             _ = c.sqlite3_reset(stmt);
-            _ = c.sqlite3_bind_text(stmt, 1, status.ptr, @intCast(status.len), SQLITE_TRANSIENT);
+            bindText(stmt, 1, status);
             _ = c.sqlite3_bind_int64(stmt, 2, port);
-            _ = c.sqlite3_bind_text(stmt, 3, k.ptr, @intCast(k.len), SQLITE_TRANSIENT);
+            bindText(stmt, 3, k);
             _ = c.sqlite3_step(stmt);
         }
     }
@@ -819,7 +874,7 @@ fn addAddrKey(
 // JSON export
 // ===========================================================================
 
-fn exportToJSON(alloc: Allocator, db: *c.sqlite3, filename: []const u8) !void {
+fn exportToJSON(alloc: Allocator, io: Io, db: *c.sqlite3, filename: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -829,10 +884,12 @@ fn exportToJSON(alloc: Allocator, db: *c.sqlite3, filename: []const u8) !void {
     {
         const sql = "SELECT address, key, nodeinfo, peers, port_status, port_checked FROM yggcrawl";
         var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK) return error.Prepare;
+        if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK)
+            return error.Prepare;
         defer _ = c.sqlite3_finalize(stmt);
 
         while (c.sqlite3_step(stmt) == SQLITE_ROW) {
+            // column text is only valid until the next step(): copy first.
             const addr = try a.dupe(u8, colText(stmt, 0));
             const key = try a.dupe(u8, colText(stmt, 1));
             const nodeinfo = try a.dupe(u8, colText(stmt, 2));
@@ -914,24 +971,20 @@ fn exportToJSON(alloc: Allocator, db: *c.sqlite3, filename: []const u8) !void {
     const root: std.json.Value = .{ .array = std.json.Array.fromOwnedSlice(a, owned) };
     const text = try std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 });
 
-    try writeFileAtomic(alloc, filename, text);
+    try writeFileAtomic(io, filename, text);
 }
 
-fn writeFileAtomic(alloc: Allocator, filename: []const u8, content: []const u8) !void {
-    const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{filename});
-    defer alloc.free(tmp);
-    const tmp_z = try alloc.dupeSentinel(u8, tmp, 0);
-    defer alloc.free(tmp_z);
-    const fn_z = try alloc.dupeSentinel(u8, filename, 0);
-    defer alloc.free(fn_z);
+fn writeFileAtomic(io: Io, filename: []const u8, content: []const u8) !void {
+    var atomic = try Dir.cwd().createFileAtomic(io, filename, .{ .replace = true });
+    defer atomic.deinit(io);
 
-    const f = c.fopen(tmp_z.ptr, "wb");
-    if (f == null) return error.FileOpen;
-    _ = c.fwrite(content.ptr, 1, content.len, f);
-    _ = c.fwrite("\n", 1, 1, f);
-    _ = c.fclose(f);
+    var buf: [8 * 1024]u8 = undefined;
+    var writer = atomic.file.writer(io, &buf);
+    try writer.interface.writeAll(content);
+    try writer.interface.writeAll("\n");
+    try writer.interface.flush();
 
-    if (c.rename(tmp_z.ptr, fn_z.ptr) != 0) return error.FileRename;
+    try atomic.replace(io);
 }
 
 // ===========================================================================
@@ -946,7 +999,8 @@ fn freeStringList(alloc: Allocator, list: *std.ArrayList([]u8)) void {
 fn queryStrings(alloc: Allocator, db: *c.sqlite3, sql: []const u8) !std.ArrayList([]u8) {
     var out = std.ArrayList([]u8).empty;
     var stmt: ?*c.sqlite3_stmt = null;
-    if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK) return error.Prepare;
+    if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != SQLITE_OK)
+        return error.Prepare;
     defer _ = c.sqlite3_finalize(stmt);
     while (c.sqlite3_step(stmt) == SQLITE_ROW) {
         const s = colText(stmt, 0);
