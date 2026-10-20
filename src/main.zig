@@ -47,6 +47,31 @@ fn println(comptime fmt: []const u8, args: anytype) void {
     g_out.flush() catch {};
 }
 
+/// The startup banner. Shared with `--help` so the two cannot disagree about
+/// what the program is about to do.
+fn printBanner(workers: usize, admin: []const u8, port: u16) void {
+    println("YggCrawl - High-performance Yggdrasil crawler (SQLite)", .{});
+    println("Workers: {d} | Admin API: {s} | Port to probe: {d}", .{ workers, admin, port });
+    println("------------------------------------------------------------------", .{});
+}
+
+/// Printed by `-h`/`--help` and then `main` returns: no database is opened, no
+/// network request is made, no crawl starts.
+fn printUsage(workers: usize, port: u16, admin: []const u8, db_path: []const u8) void {
+    printBanner(workers, admin, port);
+    println("Usage: yggcrawl [options]", .{});
+    println("", .{});
+    println("Options (each also accepts the --long and -flag=value forms):", .{});
+    println("  -workers <n>        concurrent network tasks / Io pool size (default {d})", .{DEFAULT_WORKERS});
+    println("  -port <n>           TCP port to probe on every address (default {d})", .{DEFAULT_PORT});
+    println("  -admin <host:port>  Yggdrasil Admin API address (default {s})", .{DEFAULT_ADMIN});
+    println("  -db <path>          SQLite database file (default {s})", .{DEFAULT_DB});
+    println("  -h, --help          print this help and exit, without crawling", .{});
+    println("", .{});
+    println("Current values: workers={d} port={d} admin={s} db={s}", .{ workers, port, admin, db_path });
+    println("Results: {s} (SQLite) and {s} (JSON) in the working directory.", .{ DEFAULT_DB, EXPORT_FILE });
+}
+
 /// Declaration of how long an `Io` operation may take before giving up,
 /// measured on the awake clock.
 fn timeoutOf(ms: i64) Io.Timeout {
@@ -66,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = DEFAULT_PORT;
     var admin: []const u8 = DEFAULT_ADMIN;
     var db_path: []const u8 = DEFAULT_DB;
+    var help = false;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -77,6 +103,8 @@ pub fn main(init: std.process.Init) !void {
             admin = v;
         } else if (nextArg(argv, &i, argv[i], "-db", "--db")) |v| {
             db_path = v;
+        } else if (flagMatch(argv[i], "-h", "--help") != null) {
+            help = true;
         }
     }
     if (workers == 0) workers = 1;
@@ -92,9 +120,14 @@ pub fn main(init: std.process.Init) !void {
     var stdout_writer = File.stdout().writer(io, &stdout_buf);
     g_out = &stdout_writer.interface;
 
-    println("YggCrawl - High-performance Yggdrasil crawler (SQLite)", .{});
-    println("Workers: {d} | Admin API: {s} | Port to probe: {d}", .{ workers, admin, port });
-    println("------------------------------------------------------------------", .{});
+    // Answer the question before any side effect: no database file, no admin
+    // API request, no crawl — just print and exit 0.
+    if (help) {
+        printUsage(workers, port, admin, db_path);
+        return;
+    }
+
+    printBanner(workers, admin, port);
 
     const db = initDB(alloc, db_path) catch |err| {
         println("Database initialization failed: {s}", .{@errorName(err)});

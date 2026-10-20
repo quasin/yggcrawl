@@ -41,14 +41,22 @@ host (AVX-512 on Zen 4, etc.) add `-Dcpu=native` — but that binary dies with
     -db ./yggcrawl.db
 ```
 
+`./zig-out/bin/yggcrawl --help` prints the banner, the option list with the
+current values and exits 0 — it does not open the database, does not touch the
+Admin API and does not start a crawl.
+
 Flags (both the `-flag value` and the `-flag=value` form are accepted):
 
-| Flag       | Default          | Description                       |
-|------------|------------------|-----------------------------------|
-| `-workers` | `32`             | number of parallel workers        |
-| `-port`    | `80`             | TCP port to probe                 |
-| `-admin`   | `127.0.0.1:9001` | Yggdrasil Admin API TCP address   |
-| `-db`      | `./yggcrawl.db`  | path to the SQLite file           |
+| Flag           | Default          | Description                         |
+|----------------|------------------|-------------------------------------|
+| `-workers`     | `32`             | number of parallel workers           |
+| `-port`        | `80`             | TCP port to probe                    |
+| `-admin`       | `127.0.0.1:9001` | Yggdrasil Admin API TCP address      |
+| `-db`          | `./yggcrawl.db`  | path to the SQLite file              |
+| `-h`, `--help` | —                | print help and exit, without crawling |
+
+Every flag also has a `--long` spelling (`--workers`, `--port`, `--admin`,
+`--db`).
 
 ## Architecture
 
