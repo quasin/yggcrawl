@@ -1,0 +1,18 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+.zig-cache/
+
+# Runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+yggcrawl
+yggcrawl.exe
+yggcrawl.json
+*.json.tmp
+
+# Editors
+.idea
+.vscode
+temp/
