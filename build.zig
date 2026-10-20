@@ -1,7 +1,13 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to the portable x86_64 baseline instead of the host CPU: Zig's
+    // default is `native`, which bakes in AVX-512 and friends and dies with
+    // SIGILL ("Illegal instruction") on any older machine the binary is
+    // copied to. Build with `-Dcpu=native` for a machine-local binary.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     // The only C surface left in the project: the SQLite library's headers.

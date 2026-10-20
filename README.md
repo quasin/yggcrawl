@@ -26,6 +26,11 @@ zig build -Doptimize=ReleaseFast
 # binary: zig-out/bin/yggcrawl
 ```
 
+The default target is the portable x86_64 baseline, so the resulting binary runs
+on any x86_64 machine. For a machine-local build with the full ISA of the build
+host (AVX-512 on Zen 4, etc.) add `-Dcpu=native` — but that binary dies with
+`Illegal instruction` on any CPU older than the build host.
+
 ## Usage
 
 ```sh
